@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ernyoke/imger/edgedetection"
+	"github.com/ernyoke/imger/grayscale"
 )
 
 func drawLine(img *image.RGBA, p1, p2 image.Point, col color.Color) {
@@ -90,15 +92,25 @@ func shape_gen(width, height int) []image.Point {
 	return points
 }
 
-
+func SplitAny(s string, seps string) []string {
+	splitter := func(r rune) bool {
+		return strings.ContainsRune(seps, r)
+	}
+	return strings.FieldsFunc(s, splitter)
+}
 
 func main() {
-	fp := "assets/raw/mushroom.jpg"
+	filePath := os.Args[1]
+	outBasePath := "assets/prod/"
 
-	file, err := os.Open(fp)
+	fmt.Println("[INFO] Reading file from ", filePath)
+
+	file, err := os.Open(filePath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
+
+	fileName := SplitAny(file.Name(), "/ .")[2]
 
 	img, _, err := image.Decode(file)
 	if err != nil {
@@ -108,22 +120,38 @@ func main() {
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
 
-	shapePoints := shape_gen(w, h)
+	//apply gaussian filter here
+	grey := grayscale.Grayscale(img)
+	edge_img, err := edgedetection.CannyGray(grey, 15, 45, 5)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	edgeFileName := outBasePath + fileName + "_edge.png"
+	edgeFileOut, err := os.Create(edgeFileName)
 
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+	png.Encode(edgeFileOut, edge_img)
+	fmt.Println("[INFO] Edge file saved at ", edgeFileName)
+
+	// Gaussian filter end
+
+	shapePoints := shape_gen(w, h)
 	fmt.Println("[INFO] Generated shape with", len(shapePoints), "points.")
 
 	dst := image.NewRGBA(bounds)
 	draw.Draw(dst, bounds, img, bounds.Min, draw.Src)
 	red := color.RGBA{255, 0, 0, 255}
 
-	for i := range len(shapePoints)-1 {
+	for i := range len(shapePoints) - 1 {
 		drawLine(dst, shapePoints[i], shapePoints[i+1], red)
 	}
 	drawLine(dst, shapePoints[0], shapePoints[len(shapePoints)-1], red)
 
-
-	baseName := strings.Split(file.Name(), ".")[0]
-	outFile, err := os.Create(baseName + "_out.png")
+	outFileName := outBasePath + fileName + "_out.png"
+	outFile, err := os.Create(outFileName)
 
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -134,4 +162,5 @@ func main() {
 	defer file.Close()
 
 	png.Encode(outFile, dst)
+	fmt.Println("Captcha image saved at ", outFileName)
 }
