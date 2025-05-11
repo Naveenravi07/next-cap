@@ -14,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ernyoke/imger/blur"
 	"github.com/ernyoke/imger/edgedetection"
 	"github.com/ernyoke/imger/grayscale"
+	"github.com/ernyoke/imger/padding"
 )
 
 func drawLine(img *image.RGBA, p1, p2 image.Point, col color.Color) {
@@ -62,7 +64,7 @@ func superformula(phi float64, a, b float64, m float64, n1, n2, n3 float64) floa
 	return math.Pow(term1+term2, -1/n1)
 }
 
-func shape_gen(width, height int) []image.Point {
+func shape_gen_in_region(x, y, w, h int) []image.Point {
 	rand.Seed(time.Now().UnixNano())
 
 	numPoints := 361
@@ -75,18 +77,18 @@ func shape_gen(width, height int) []image.Point {
 	n2 := rand.Float64()*3 + 1
 	n3 := rand.Float64()*3 + 1
 
-	scale := float64(min(width, height)) * 0.2
-	cx := float64(width) / 2
-	cy := float64(height) / 2
+	scale := float64(min(w, h)) * 0.4 // tighter fit
+	cx := float64(x + w/2)
+	cy := float64(y + h/2)
 
 	for i := range numPoints {
 		phi := float64(i) * math.Pi / 180
 		r := superformula(phi, a, b, m, n1, n2, n3)
 
-		x := cx + scale*r*math.Cos(phi)
-		y := cy + scale*r*math.Sin(phi)
+		xp := cx + scale*r*math.Cos(phi)
+		yp := cy + scale*r*math.Sin(phi)
 
-		points = append(points, image.Point{X: int(x), Y: int(y)})
+		points = append(points, image.Point{X: int(xp), Y: int(yp)})
 	}
 
 	return points
@@ -97,6 +99,22 @@ func SplitAny(s string, seps string) []string {
 		return strings.ContainsRune(seps, r)
 	}
 	return strings.FieldsFunc(s, splitter)
+}
+
+func findMaxHeat(heatmap [][]int) (maxVal, maxI, maxJ int) {
+	maxVal = heatmap[0][0]
+	maxI, maxJ = 0, 0
+
+	for i := range len(heatmap) {
+		for j := range len(heatmap[i]) {
+			if heatmap[i][j] > maxVal {
+				maxVal = heatmap[i][j]
+				maxI, maxJ = i, j
+			}
+		}
+	}
+
+	return
 }
 
 func main() {
@@ -122,23 +140,62 @@ func main() {
 
 	//apply gaussian filter here
 	grey := grayscale.Grayscale(img)
-	edge_img, err := edgedetection.CannyGray(grey, 15, 45, 5)
+	blur_img, err := blur.GaussianBlurGray(grey, 7, 3,padding.BorderConstant)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
-	edgeFileName := outBasePath + fileName + "_edge.png"
-	edgeFileOut, err := os.Create(edgeFileName)
 
+	edge_img, err := edgedetection.CannyGray(blur_img, 10, 100, 3)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return
 	}
-	png.Encode(edgeFileOut, edge_img)
-	fmt.Println("[INFO] Edge file saved at ", edgeFileName)
 
-	// Gaussian filter end
+	// Calculate Heatmap
+	blockRows := 5
+	blockCols := 5
 
-	shapePoints := shape_gen(w, h)
+	blockW := w / blockCols
+	blockH := h / blockRows
+
+	fmt.Println("Blockw = ", blockW, "  BlockH = ", blockH)
+
+	heatmap := make([][]int, blockRows)
+	for i := range heatmap {
+		heatmap[i] = make([]int, blockCols)
+	}
+
+	for y := range h {
+		for x := range w {
+			gray := edge_img.GrayAt(x, y).Y
+			if gray > 128 {
+				row := y / blockH
+				col := x / blockW
+
+				if row < blockRows && col < blockCols {
+					heatmap[row][col]++
+				}
+			}
+		}
+	}
+
+	fmt.Println("[INFO] Heatmap calculated ")
+	for i := range blockRows {
+		fmt.Println("")
+		for j := range blockCols {
+			fmt.Print(" ", heatmap[i][j], " ")
+		}
+	}
+	fmt.Println()
+
+	max, row, col := findMaxHeat(heatmap)
+	x := col * blockW
+	y := row * blockH
+
+	fmt.Println("Max heat on x=", x, " y =", y, " heat=", max)
+
+	// Generate random shape
+
+	shapePoints := shape_gen_in_region(x, y, blockW, blockH)
 	fmt.Println("[INFO] Generated shape with", len(shapePoints), "points.")
 
 	dst := image.NewRGBA(bounds)
@@ -150,6 +207,19 @@ func main() {
 	}
 	drawLine(dst, shapePoints[0], shapePoints[len(shapePoints)-1], red)
 
+	// Save  images
+
+	edgeFileName := outBasePath + fileName + "_edge.png"
+	edgeFileOut, err := os.Create(edgeFileName)
+
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+	png.Encode(edgeFileOut, edge_img)
+	fmt.Println("[INFO] Edge file saved at ", edgeFileName)
+	defer edgeFileOut.Close()
+
 	outFileName := outBasePath + fileName + "_out.png"
 	outFile, err := os.Create(outFileName)
 
@@ -158,9 +228,9 @@ func main() {
 		return
 	}
 
+	png.Encode(outFile, dst)
 	defer outFile.Close()
 	defer file.Close()
 
-	png.Encode(outFile, dst)
-	fmt.Println("Captcha image saved at ", outFileName)
+	fmt.Println("[INFO] Captcha image saved at ", outFileName)
 }
