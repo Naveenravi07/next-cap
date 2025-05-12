@@ -1,415 +1,235 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
-	"image"
-	"image/color"
-	"image/draw"
-	_ "image/jpeg"
-	"image/png"
-	_ "image/png"
-	"math"
-	"math/rand"
+	"html/template"
+	"net/http"
 	"os"
-	"path/filepath"
-	"sort"
-	"strings"
-	"time"
 
-	"github.com/ernyoke/imger/blur"
-	"github.com/ernyoke/imger/edgedetection"
-	"github.com/ernyoke/imger/grayscale"
-	"github.com/ernyoke/imger/padding"
+	_ "github.com/mattn/go-sqlite3"
 )
 
-func drawLine(img *image.RGBA, p1, p2 image.Point, col color.Color) {
-	dx := math.Abs(float64(p2.X - p1.X))
-	dy := math.Abs(float64(p2.Y - p1.Y))
-
-	x1, y1 := p1.X, p1.Y
-	x2, y2 := p2.X, p2.Y
-
-	sx := 1
-	if x1 > x2 {
-		sx = -1
-	}
-
-	sy := 1
-	if y1 > y2 {
-		sy = -1
-	}
-
-	err := dx - dy
-	for {
-		if image.Pt(x1, y1).In(img.Bounds()) {
-			img.Set(x1, y1, col)
-		}
-		if x1 == x2 && y1 == y2 {
-			break
-		}
-
-		e2 := 2 * err
-		if e2 > -dy {
-			err -= dy
-			x1 += sx
-		}
-		if e2 < dx {
-			err += dx
-			y1 += sy
-		}
-	}
+type CaptchaResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
 }
 
-func superformula(phi float64, a, b float64, m float64, n1, n2, n3 float64) float64 {
-	term1 := math.Pow(math.Abs(math.Cos(m*phi/4)/a), n2)
-	term2 := math.Pow(math.Abs(math.Sin(m*phi/4)/b), n3)
-	return math.Pow(term1+term2, -1/n1)
+type CaptchaData struct {
+	ImageID     string `json:"image_id"`
+	MainImage   string `json:"main_image"`
+	CutoutImage string `json:"cutout_image"`
 }
 
-func shape_gen_in_region(x, y, w, h int) []image.Point {
-	rand.Seed(time.Now().UnixNano())
-
-	numPoints := 361
-	points := make([]image.Point, 0, numPoints)
-
-	a := rand.Float64()*0.5 + 0.6
-	b := rand.Float64()*0.5 + 0.6
-	m := float64(rand.Intn(10) + 3)
-	n1 := rand.Float64()*3 + 1
-	n2 := rand.Float64()*3 + 1
-	n3 := rand.Float64()*3 + 1
-
-	scale := float64(min(w, h)) * 0.4 // tighter fit
-	cx := float64(x + w/2)
-	cy := float64(y + h/2)
-
-	for i := range numPoints {
-		phi := float64(i) * math.Pi / 180
-		r := superformula(phi, a, b, m, n1, n2, n3)
-
-		xp := cx + scale*r*math.Cos(phi)
-		yp := cy + scale*r*math.Sin(phi)
-
-		points = append(points, image.Point{X: int(xp), Y: int(yp)})
-	}
-
-	return points
-}
-
-func SplitAny(s string, seps string) []string {
-	splitter := func(r rune) bool {
-		return strings.ContainsRune(seps, r)
-	}
-	return strings.FieldsFunc(s, splitter)
-}
-
-func findMaxHeat(heatmap [][]int) (maxVal, maxI, maxJ int) {
-	maxVal = heatmap[0][0]
-	maxI, maxJ = 0, 0
-
-	for i := range len(heatmap) {
-		for j := range len(heatmap[i]) {
-			if heatmap[i][j] > maxVal {
-				maxVal = heatmap[i][j]
-				maxI, maxJ = i, j
-			}
-		}
-	}
-
-	return
-}
-
-func replaceShapeContentWithWhite(img image.Image, shapePoints []image.Point, outPath string) error {
-	if len(shapePoints) < 3 {
-		return fmt.Errorf("not enough points to create a shape: %d", len(shapePoints))
-	}
-
-	// Get the bounds of the original image
-	bounds := img.Bounds()
-
-	// Create a new Alpha (transparency) mask with the same dimensions as the original image
-	mask := image.NewAlpha(bounds)
-
-	// Create another Alpha image for the polygon
-	poly := &image.Alpha{
-		Pix:    make([]uint8, bounds.Dx()*bounds.Dy()), // Create pixel buffer
-		Stride: bounds.Dx(),                            // Width of one row in bytes
-		Rect:   bounds,                                 // Image dimensions
-	}
-
-	// Fill the polygon defined by our shape points
-	fillPolygon(poly, shapePoints)
-
-	// Copy the polygon image to our mask
-	draw.Draw(mask, bounds, poly, bounds.Min, draw.Src)
-
-	// Create a new RGBA image for the output, starting with a copy of the original
-	output := image.NewRGBA(bounds)
-	draw.Draw(output, bounds, img, bounds.Min, draw.Src)
-
-	// White color to use for filling
-	white := color.RGBA{255, 255, 255, 255} // Fully opaque white
-
-	// For each pixel in the image...
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			// If the mask has non-zero alpha at this position (inside the polygon)
-			if mask.AlphaAt(x, y).A > 0 {
-				// Replace with white
-				output.Set(x, y, white)
-			}
-			// Pixels outside the polygon are already copied from the original image
-		}
-	}
-
-	// Create directory structure if it doesn't exist
-	dir := filepath.Dir(outPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	// Create the output file
-	outFile, err := os.Create(outPath)
+func getRandomCaptcha(db *sql.DB) (*CaptchaData, error) {
+	var imageID string
+	err := db.QueryRow("SELECT image_id FROM captchas ORDER BY RANDOM() LIMIT 1").Scan(&imageID)
 	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	// Encode and save the image as PNG
-	return png.Encode(outFile, output)
-}
-
-func extractShapeContent(img image.Image, shapePoints []image.Point, outPath string) error {
-	if len(shapePoints) < 3 {
-		return fmt.Errorf("not enough points to create a shape: %d", len(shapePoints))
-	}
-	bounds := img.Bounds()
-
-	mask := image.NewAlpha(bounds)
-
-	poly := &image.Alpha{
-		Pix:    make([]uint8, bounds.Dx()*bounds.Dy()),
-		Stride: bounds.Dx(),
-		Rect:   bounds,
+		return nil, fmt.Errorf("failed to get random captcha: %v", err)
 	}
 
-	fillPolygon(poly, shapePoints)
-	draw.Draw(mask, bounds, poly, bounds.Min, draw.Src)
-	output := image.NewRGBA(bounds)
-
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			if mask.AlphaAt(x, y).A > 0 {
-				output.Set(x, y, img.At(x, y))
-			} else {
-				output.Set(x, y, color.Transparent)
-			}
-		}
-	}
-
-	dir := filepath.Dir(outPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	outFile, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	return png.Encode(outFile, output)
-}
-
-func fillPolygon(img *image.Alpha, points []image.Point) {
-
-	bounds := img.Bounds()
-	minY := points[0].Y
-	maxY := points[0].Y
-	for _, p := range points {
-		if p.Y < minY {
-			minY = p.Y
-		}
-		if p.Y > maxY {
-			maxY = p.Y
-		}
-	}
-
-	if minY < bounds.Min.Y {
-		minY = bounds.Min.Y
-	}
-	if maxY >= bounds.Max.Y {
-		maxY = bounds.Max.Y - 1
-	}
-
-	for y := minY; y <= maxY; y++ {
-		var intersections []int
-		for i := range points {
-			j := (i + 1) % len(points)
-			p1 := points[i]
-			p2 := points[j]
-
-			if (p1.Y <= y && p2.Y > y) || (p2.Y <= y && p1.Y > y) {
-				if p1.Y == p2.Y {
-					intersections = append(intersections, p1.X)
-					intersections = append(intersections, p2.X)
-				} else {
-					x := p1.X + (y-p1.Y)*(p2.X-p1.X)/(p2.Y-p1.Y)
-					intersections = append(intersections, x)
-				}
-			}
-		}
-
-		sort.Ints(intersections)
-
-		for i := 0; i < len(intersections); i += 2 {
-			if i+1 < len(intersections) {
-				startX := intersections[i]
-				endX := intersections[i+1]
-
-				if startX < bounds.Min.X {
-					startX = bounds.Min.X
-				}
-				if endX >= bounds.Max.X {
-					endX = bounds.Max.X - 1
-				}
-
-				for x := startX; x <= endX; x++ {
-					img.SetAlpha(x, y, color.Alpha{A: 255})
-				}
-			}
-		}
-	}
+	return &CaptchaData{
+		ImageID:     imageID,
+		MainImage:   fmt.Sprintf("/assets/prod/%s/white_fill.png", imageID),
+		CutoutImage: fmt.Sprintf("/assets/prod/%s/shape_extract.png", imageID),
+	}, nil
 }
 
 func main() {
-	filePath := os.Args[1]
-	outBasePath := "assets/prod/"
-
-	fmt.Println("[INFO] Reading file from ", filePath)
-
-	file, err := os.Open(filePath)
+	db, err := sql.Open("sqlite3", "captcha.db")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-	}
-
-	fileName := SplitAny(file.Name(), "/ .")[2]
-
-	img, _, err := image.Decode(file)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-	}
-
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-
-	//apply gaussian filter here
-	grey := grayscale.Grayscale(img)
-	blur_img, err := blur.GaussianBlurGray(grey, 7, 3, padding.BorderConstant)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-	}
-
-	edge_img, err := edgedetection.CannyGray(blur_img, 10, 100, 3)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-	}
-
-	// Calculate Heatmap
-	blockRows := 5
-	blockCols := 5
-
-	blockW := w / blockCols
-	blockH := h / blockRows
-
-	fmt.Println("Blockw = ", blockW, "  BlockH = ", blockH)
-
-	heatmap := make([][]int, blockRows)
-	for i := range heatmap {
-		heatmap[i] = make([]int, blockCols)
-	}
-
-	for y := range h {
-		for x := range w {
-			gray := edge_img.GrayAt(x, y).Y
-			if gray > 128 {
-				row := y / blockH
-				col := x / blockW
-
-				if row < blockRows && col < blockCols {
-					heatmap[row][col]++
-				}
-			}
-		}
-	}
-
-	fmt.Println("[INFO] Heatmap calculated ")
-	for i := range blockRows {
-		fmt.Println("")
-		for j := range blockCols {
-			fmt.Print(" ", heatmap[i][j], " ")
-		}
-	}
-	fmt.Println()
-
-	max, row, col := findMaxHeat(heatmap)
-	x := col * blockW
-	y := row * blockH
-
-	fmt.Println("Max heat on x=", x, " y =", y, " heat=", max)
-
-	// Generate random shape
-
-	shapePoints := shape_gen_in_region(x, y, blockW, blockH)
-	fmt.Println("[INFO] Generated shape with", len(shapePoints), "points.")
-
-	dst := image.NewRGBA(bounds)
-	draw.Draw(dst, bounds, img, bounds.Min, draw.Src)
-	red := color.RGBA{255, 0, 0, 255}
-
-	for i := range len(shapePoints) - 1 {
-		drawLine(dst, shapePoints[i], shapePoints[i+1], red)
-	}
-	drawLine(dst, shapePoints[0], shapePoints[len(shapePoints)-1], red)
-
-	// Save  images
-	edgeFileName := outBasePath + fileName + "_edge.png"
-	edgeFileOut, err := os.Create(edgeFileName)
-
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return
-	}
-	png.Encode(edgeFileOut, edge_img)
-	fmt.Println("[INFO] Edge file saved at ", edgeFileName)
-	defer edgeFileOut.Close()
-
-	outPath := filepath.Join(outBasePath, fileName+"_shape_extract.png")
-	if err := extractShapeContent(img, shapePoints, outPath); err != nil {
-		fmt.Fprintln(os.Stderr, "Error extracting shape content:", err)
+		fmt.Fprintf(os.Stderr, "Failed to open database: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("[INFO] Shape content extracted and saved to", outPath)
+	defer db.Close()
 
-	// Create white-filled version
-	whitePath := filepath.Join(outBasePath, fileName+"_white_fill.png")
-	if err := replaceShapeContentWithWhite(img, shapePoints, whitePath); err != nil {
-		fmt.Fprintln(os.Stderr, "Error creating white-filled shape:", err)
+	schemaSQL, err := os.ReadFile("schema.sql")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read schema: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("[INFO] White-filled shape created and saved to", whitePath)
-
-	outFileName := outBasePath + fileName + "_out.png"
-	outFile, err := os.Create(outFileName)
-
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return
+	if _, err := db.Exec(string(schemaSQL)); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize schema: %v\n", err)
+		os.Exit(1)
 	}
 
-	png.Encode(outFile, dst)
-	defer outFile.Close()
-	defer file.Close()
+	fs := http.FileServer(http.Dir("assets"))
+	http.Handle("/assets/", http.StripPrefix("/assets/", fs))
 
-	fmt.Println("[INFO] Captcha image saved at ", outFileName)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		captcha, err := getRandomCaptcha(db)
+		if err != nil {
+			http.Error(w, "Failed to get captcha", http.StatusInternalServerError)
+			return
+		}
+
+		tmpl := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Captcha Challenge</title>
+    <style>
+        .container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            gap: 20px;
+        }
+        .captcha-area {
+            position: relative;
+            border: 2px solid #ccc;
+            margin: 10px;
+        }
+        #mainImage {
+            max-width: 100%;
+            display: block;
+        }
+        #cutout {
+            cursor: move;
+            position: absolute;
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="captcha-area">
+            <img id="mainImage" src="{{.MainImage}}" alt="Captcha">
+            <img id="cutout" src="{{.CutoutImage}}" alt="Cutout" draggable="true">
+        </div>
+    </div>
+
+    <script>
+        let cutout = document.getElementById('cutout');
+        let isDragging = false;
+        let currentX;
+        let currentY;
+        let initialX;
+        let initialY;
+        let xOffset = 0;
+        let yOffset = 0;
+
+        cutout.addEventListener('mousedown', dragStart);
+        document.addEventListener('mousemove', drag);
+        document.addEventListener('mouseup', dragEnd);
+
+        function dragStart(e) {
+            initialX = e.clientX - xOffset;
+            initialY = e.clientY - yOffset;
+
+            if (e.target === cutout) {
+                isDragging = true;
+            }
+        }
+
+        function drag(e) {
+            if (isDragging) {
+                e.preventDefault();
+                currentX = e.clientX - initialX;
+                currentY = e.clientY - initialY;
+
+                xOffset = currentX;
+                yOffset = currentY;
+
+                setTranslate(currentX, currentY, cutout);
+            }
+        }
+
+        function setTranslate(xPos, yPos, el) {
+            el.style.transform = "translate3d(" + xPos + "px, " + yPos + "px, 0)";
+        }
+
+        function dragEnd(e) {
+            if (isDragging) {
+                isDragging = false;
+                
+                // Get position relative to main image
+                let mainImage = document.getElementById('mainImage');
+                let mainRect = mainImage.getBoundingClientRect();
+                let cutoutRect = cutout.getBoundingClientRect();
+                
+                let relativeX = Math.round(cutoutRect.left - mainRect.left);
+                let relativeY = Math.round(cutoutRect.top - mainRect.top);
+
+                // Validate position
+                fetch('/validate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        imageId: '{{.ImageID}}',
+                        x: relativeX,
+                        y: relativeY
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('Correct!');
+                        window.location.reload();
+                    } else {
+                        alert('Try again');
+                    }
+                });
+            }
+        }
+    </script>
+</body>
+</html>
+`
+		t := template.Must(template.New("captcha").Parse(tmpl))
+		t.Execute(w, captcha)
+	})
+
+	http.HandleFunc("/validate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var request struct {
+			ImageID string `json:"imageId"`
+			X       int    `json:"x"`
+			Y       int    `json:"y"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		var validationData ValidationData
+		err := db.QueryRow(`
+			SELECT image_id, valid_x, valid_y, tolerance, shape_width, shape_height 
+			FROM captchas 
+			WHERE image_id = ?
+		`, request.ImageID).Scan(
+			&validationData.ImageID,
+			&validationData.ValidX,
+			&validationData.ValidY,
+			&validationData.Tolerance,
+			&validationData.ShapeWidth,
+			&validationData.ShapeHeight,
+		)
+		if err != nil {
+			http.Error(w, "Failed to load validation data", http.StatusInternalServerError)
+			return
+		}
+
+		success := ValidateCaptchaAttempt(validationData, request.X, request.Y)
+
+		response := CaptchaResponse{
+			Success: success,
+			Message: map[bool]string{true: "Correct!", false: "Try again"}[success],
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	fmt.Println("Server starting on :8080...")
+	http.ListenAndServe(":8080", nil)
 }

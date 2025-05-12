@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS captchas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id TEXT NOT NULL UNIQUE,
+    valid_x INTEGER NOT NULL,
+    valid_y INTEGER NOT NULL,
+    tolerance INTEGER NOT NULL,
+    shape_width INTEGER NOT NULL,
+    shape_height INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+); 
